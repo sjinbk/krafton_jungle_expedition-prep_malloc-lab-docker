@@ -46,6 +46,10 @@ team_t team = {
 #define word_size 4
 #define chunk_size (1<<12)
 
+/* 추가 상수 정의: header+footer 오버헤드와 split 가능한 최소 block 크기 */
+#define block_overhead (2 * word_size)
+#define min_block_size (block_overhead + ALIGNMENT)
+
 /* 보조 계산 매크로: 두 값 중 큰 값을 선택 */
 #define MAX(x, y)               ( (x) > (y) ? (x) : (y) )
 
@@ -76,6 +80,7 @@ static void *extend_heap(size_t words);     // heap 확장
 static void *coalesce(void *bp);            // Coalescing
 static void *find_fit(size_t adjusted_size);        // Placement (First-Fit)
 static void place(void *bp, size_t adjusted_size);  // Splitting
+static size_t adjust_block_size(size_t size);       // 요청 payload를 실제 block 크기로 보정
 
 /* heap 확장 */
 // 입력
@@ -210,7 +215,7 @@ static void place(void *bp, size_t adjusted_size)
 
     // 동작 명세: block을 할당 처리하고 남는 공간이 충분하면 분할
         // STEP 1. 나머지 공간이 최소 block 크기(헤더+푸터+정렬 단위) 이상이면 split
-        if ((current_size - adjusted_size) >= (word_size * 2 + ALIGNMENT)) {
+        if ((current_size - adjusted_size) >= min_block_size) {
             // STEP 1-1 .앞부분은 요청 크기의 allocated block으로 표시
             PUT_VALUE(HEADER_BP(bp), PACK_INFO(adjusted_size, 1));
             PUT_VALUE(FOOTER_BP(bp), PACK_INFO(adjusted_size, 1));
@@ -224,6 +229,25 @@ static void place(void *bp, size_t adjusted_size)
             PUT_VALUE(HEADER_BP(bp), PACK_INFO(current_size, 1));
             PUT_VALUE(FOOTER_BP(bp), PACK_INFO(current_size, 1));
         }
+}
+
+/* block size 보정 */
+// 입력
+    // size: 사용자가 요청한 payload 바이트 수
+
+// 출력
+    // header/footer와 alignment를 반영한 실제 block 크기
+static size_t adjust_block_size(size_t size)
+{
+    // 동작 명세: 작은 요청은 최소 block 크기로 올리고, 일반 요청은 정렬 단위에 맞춰 반올림
+
+    if (size <= ALIGNMENT) {
+        // STEP 1. payload가 alignment 이하이면 최소 allocated block 크기 반환
+        return 2 * ALIGNMENT;
+    }
+
+    // STEP 2. 아니면 block overhead를 더한 뒤 alignment 배수로 올림
+    return ((size + block_overhead + (ALIGNMENT - 1)) / ALIGNMENT) * ALIGNMENT;
 }
 
 /* mm_init */
@@ -286,6 +310,8 @@ void *mm_malloc(size_t size)
             adjusted_size = ((size + (2 * word_size) + (ALIGNMENT - 1)) / ALIGNMENT) * ALIGNMENT;
 
         // STEP 4. 현재 implicit free list에서 First-Fit block을 찾는다.
+        adjusted_size = adjust_block_size(size);
+
         if ((bp = find_fit(adjusted_size)) != NULL) {
             // STEP 5. 적합한 block을 찾았으면 필요 시 split해서 배치하고 주소를 반환
             place(bp, adjusted_size);
@@ -311,8 +337,6 @@ void mm_free(void *ptr)
 {
     size_t size = GET_SIZE(HEADER_BP(ptr)); // 해제 대상 block의 전체 크기
 
-
-
     // 동작 명세: 현재 block을 free 상태로 바꾸고 즉시 병합
         // STEP 1. header/footer의 alloc bit를 0으로 바꿔 free block임을 표시
         PUT_VALUE(HEADER_BP(ptr), PACK_INFO(size, 0));
@@ -322,20 +346,250 @@ void mm_free(void *ptr)
 }
 
 /* mm_realloc */
-/* 아직 naive allocator */
-void *mm_realloc(void *ptr, size_t size)
-{
-    void *oldptr = ptr;
-    void *newptr;
-    size_t copySize;
+// 입력
+    // ptr  : 기존에 할당된 block의 payload 시작 주소
+    // size : 새로 요청된 payload 바이트 수
 
-    newptr = mm_malloc(size);
-    if (newptr == NULL)
+// 출력
+    // 재할당 결과 block의 payload 시작 주소
+
+// 전체 동작 명세
+    /* 
+    ┌─ [예외 처리]
+    │   ├─ ptr == NULL  → mm_malloc(size)
+    │   └─ size == 0    → mm_free(ptr), return NULL
+    │
+    ├─ 요청 크기 보정
+    │   ├─ adjusted_size = adjust_block_size(size)
+    │   └─ old_size = 현재 block 전체 크기
+    │
+    ├─ [경우 1] 이미 현재 block이 충분히 큰가?
+    │   ├─ YES
+    │   │   ├─ 남는 공간이 min_block_size 이상?
+    │   │   │   ├─ YES → 뒤를 split해서 free block 생성
+    │   │   │   └─ NO  → 그냥 그대로 사용
+    │   │   └─ return oldptr
+    │   └─ NO
+    │
+    ├─ 인접 block 조사
+    │   ├─ prev_bp, next_bp
+    │   ├─ prev_size, next_size
+    │   └─ next가 epilogue면 heap 확장 시도
+    │
+    ├─ [경우 2] 뒤 block만 합쳐서 해결 가능한가?
+    │   ├─ next free && old + next >= adjusted_size
+    │   │   ├─ 현재 위치에서 뒤로 확장
+    │   │   ├─ 필요하면 split
+    │   │   └─ return oldptr
+    │   └─ 실패
+    │
+    ├─ [경우 3] 앞 + 현재 + 뒤 세 block 합치면 가능한가?
+    │   ├─ prev free && next free && prev + old + next >= adjusted_size
+    │   │   ├─ 시작점이 prev_bp로 이동
+    │   │   ├─ payload memmove
+    │   │   ├─ 필요하면 split
+    │   │   └─ return prev_bp
+    │   └─ 실패
+    │
+    ├─ [경우 4] 앞 block만 합치면 가능한가?
+    │   ├─ prev free && prev + old >= adjusted_size
+    │   │   ├─ 시작점이 prev_bp로 이동
+    │   │   ├─ payload memmove
+    │   │   ├─ 필요하면 split
+    │   │   └─ return prev_bp
+    │   └─ 실패
+    │
+    └─ [최후 수단]
+        ├─ newptr = mm_malloc(size)
+        ├─ payload 복사
+        ├─ mm_free(oldptr)
+        └─ return newptr
+    */
+
+void *mm_realloc(void *ptr, size_t size) {
+    void *oldptr = ptr;      // 기존 block의 payload 시작 주소
+    void *newptr;            // 제자리/인접 확장 실패 시 새로 할당할 block의 payload 시작 주소
+    void *prev_bp;           // 이전 block의 payload 시작 주소
+    void *next_bp;           // 다음 block의 payload 시작 주소
+    size_t adjusted_size;    // 요청 payload를 alignment + overhead까지 반영한 실제 block 크기
+    size_t old_size;         // 기존 block의 전체 크기(header/footer 포함)
+    size_t combined_size;    // 인접 block과 합쳤을 때의 전체 크기
+    size_t copySize;         // 실제로 복사할 payload 바이트 수
+    size_t prev_size;        // 이전 block의 전체 크기
+    size_t next_size;        // 다음 block의 전체 크기
+
+    /* 1. 예외 처리 */
+
+    // realloc(NULL, size)는 malloc(size)와 같은 의미
+    if (oldptr == NULL) {
+        return mm_malloc(size);
+    }
+
+    // realloc(ptr, 0)은 기존 block을 해제하고 NULL 반환
+    if (size == 0) {
+        mm_free(oldptr);
         return NULL;
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-    if (size < copySize)
+    }
+
+    /* 2. 요청 크기와 현재 block 크기 계산 */
+
+    // 요청 payload 크기를 실제 block 크기 단위로 보정
+    adjusted_size = adjust_block_size(size);
+
+    // 현재 block의 전체 크기를 읽음
+    old_size = GET_SIZE(HEADER_BP(oldptr));
+
+    /* 3. 현재 block만으로 해결 가능한 경우 */
+
+    // 이미 현재 block이 충분히 크면 기존 위치를 그대로 재사용
+    if (old_size >= adjusted_size) {
+        // 남는 공간이 최소 free block 크기 이상이면 뒤쪽을 분리해서 free block으로 남김
+        if ((old_size - adjusted_size) >= min_block_size) {
+            place(oldptr, adjusted_size);
+
+            // split으로 생긴 뒤 free block이 다음 free block과 이어질 수 있으므로 병합
+            coalesce(NEXT_BP(oldptr));
+        }
+
+        // payload 시작 주소가 바뀌지 않으므로 기존 포인터 반환
+        return oldptr;
+    }
+
+    /* 4. 인접 block 정보 확인 */
+
+    // 현재 block만으로는 부족하므로 앞/뒤 인접 block 정보를 읽음
+    prev_bp = PREV_BP(oldptr);
+    next_bp = NEXT_BP(oldptr);
+    prev_size = GET_SIZE(HEADER_BP(prev_bp));
+    next_size = GET_SIZE(HEADER_BP(next_bp));
+
+    // 다음 block이 epilogue라면 heap 끝에 도달한 상태이므로 heap 확장 시도
+    if (next_size == 0) {
+        // 부족한 크기와 기본 확장 단위 중 더 큰 값만큼 heap 확장
+        size_t extend_size = MAX(adjusted_size - old_size, chunk_size);
+        if (extend_heap(extend_size / word_size) != NULL) {
+            // heap 확장 후 oldptr 뒤쪽에 새 free block이 생기므로 정보 갱신
+            next_bp = NEXT_BP(oldptr);
+            next_size = GET_SIZE(HEADER_BP(next_bp));
+        }
+    }
+
+    /* 5. 뒤 free block과 합쳐 제자리 확장 가능한지 확인 */
+
+    // 다음 block이 free라면 현재 block과 합쳐서 payload 시작 주소를 유지한 채 확장 시도
+    if (!GET_ALLOC(HEADER_BP(next_bp))) {
+        combined_size = old_size + next_size;
+
+        // 현재 + 뒤 block만으로 요청 크기를 만족할 수 있으면 제자리 확장 가능
+        if (combined_size >= adjusted_size) {
+            // 현재 block부터 다음 block까지를 하나의 큰 allocated block으로 먼저 묶음
+            PUT_VALUE(HEADER_BP(oldptr), PACK_INFO(combined_size, 1));
+            PUT_VALUE(FOOTER_BP(next_bp), PACK_INFO(combined_size, 1));
+
+            // 요청 크기 기준으로 다시 배치하여 남는 공간이 있으면 뒤쪽을 split
+            place(oldptr, adjusted_size);
+
+            // split 결과 남은 free block이 있다면 다음 free block과 병합
+            if ((combined_size - adjusted_size) >= min_block_size) {
+                coalesce(NEXT_BP(oldptr));
+            }
+
+            // payload 시작 주소가 바뀌지 않았으므로 기존 포인터 반환
+            return oldptr;
+        }
+    }
+
+    /* 6. 앞+현재+뒤를 합쳐 확장 가능한지 확인 */
+
+    // 앞/뒤 block이 모두 free이면 세 block을 합쳐 더 큰 공간을 확보할 수 있음
+    // 이 경우 새 payload 시작 주소는 prev_bp가 되므로 데이터 이동이 필요
+    if (!GET_ALLOC(HEADER_BP(prev_bp)) && !GET_ALLOC(HEADER_BP(next_bp))) {
+        combined_size = old_size + prev_size + next_size;
+
+        if (combined_size >= adjusted_size) {
+            // 복사 대상은 기존 payload뿐이므로 overhead(header/footer)는 제외
+            copySize = old_size - block_overhead;
+
+            // 새 요청 payload 크기를 넘겨 복사하지 않도록 상한을 size로 제한
+            if (size < copySize) {
+                copySize = size;
+            }
+
+            // prev block부터 next block까지를 하나의 큰 allocated block으로 묶음
+            PUT_VALUE(HEADER_BP(prev_bp), PACK_INFO(combined_size, 1));
+            PUT_VALUE(FOOTER_BP(next_bp), PACK_INFO(combined_size, 1));
+
+            // 시작 주소가 prev_bp로 바뀌므로 기존 payload를 앞으로 이동
+            memmove(prev_bp, oldptr, copySize);
+
+            // 요청 크기에 맞게 다시 배치하고 남는 공간은 뒤쪽 free block으로 분리
+            place(prev_bp, adjusted_size);
+
+            // split 결과 생긴 free block이 다음 free block과 이어질 수 있으므로 병합
+            if ((combined_size - adjusted_size) >= min_block_size) {
+                coalesce(NEXT_BP(prev_bp));
+            }
+
+            // 새 payload 시작 주소 반환
+            return prev_bp;
+        }
+    }
+
+    /* 7. 앞 free block과만 합쳐 확장 가능한지 확인 */
+
+    // 앞 block만 free라면 시작 주소를 앞으로 옮기는 방식으로 확장 시도
+    if (!GET_ALLOC(HEADER_BP(prev_bp))) {
+        combined_size = old_size + prev_size;
+
+        if (combined_size >= adjusted_size) {
+            // 복사 대상은 기존 payload이며, 새 요청 payload 크기를 넘기지 않도록 제한
+            copySize = old_size - block_overhead;
+            if (size < copySize) {
+                copySize = size;
+            }
+
+            // prev block부터 old block까지를 하나의 큰 allocated block으로 묶음
+            PUT_VALUE(HEADER_BP(prev_bp), PACK_INFO(combined_size, 1));
+            PUT_VALUE(FOOTER_BP(oldptr), PACK_INFO(combined_size, 1));
+
+            // 새 payload 시작 주소가 prev_bp로 바뀌므로 데이터를 앞으로 이동
+            memmove(prev_bp, oldptr, copySize);
+
+            // 요청 크기 기준으로 다시 배치하고 남는 공간은 뒤쪽 free block으로 분리
+            place(prev_bp, adjusted_size);
+
+            // split 결과 생긴 free block이 다음 free block과 이어질 수 있으므로 병합
+            if ((combined_size - adjusted_size) >= min_block_size) {
+                coalesce(NEXT_BP(prev_bp));
+            }
+
+            // 새 payload 시작 주소 반환
+            return prev_bp;
+        }
+    }
+
+    /* 8. 최후 수단: 새 block 할당 후 복사 */
+
+    // 제자리 재사용과 인접 block 확장이 모두 실패하면 새 block을 할당
+    newptr = mm_malloc(size);
+    if (newptr == NULL) {
+        return NULL;
+    }
+
+    // 기존 block 전체가 아니라 payload만 복사해야 하므로 overhead는 제외
+    copySize = old_size - block_overhead;
+
+    // 새 요청 payload 크기를 넘겨 복사하지 않도록 상한을 size로 제한
+    if (size < copySize) {
         copySize = size;
+    }
+
+    // 새 block으로 기존 payload를 복사
     memcpy(newptr, oldptr, copySize);
+
+    // 기존 block은 더 이상 필요 없으므로 해제
     mm_free(oldptr);
+
+    // 새로 확보한 block의 payload 시작 주소 반환
     return newptr;
 }
